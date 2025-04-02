@@ -32,7 +32,7 @@ login usersite
 ### 1. Clone o repositório
 
 ```bash
-git clone https://github.com/seu-usuario/wordpress-podman-caddy-installer.git
+https://github.com/oliveira903/wordpress-podman-caddy-installer
 cd wordpress-podman-caddy-installer
 ```
 
