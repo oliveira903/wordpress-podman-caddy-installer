@@ -1,0 +1,51 @@
+#buscar-site
+
+#!/bin/bash
+
+echo "🌐 Informe o domínio para buscar (ex: meusite.4have.com.br):"
+read DOMAIN
+
+CADDY_SITES_DIR="/home/site4have/Caddy/sites"
+CONF_FILE="$CADDY_SITES_DIR/$DOMAIN.conf"
+
+if [[ ! -f "$CONF_FILE" ]]; then
+  echo "❌ Arquivo de configuração do Caddy não encontrado para o domínio '$DOMAIN'."
+  exit 1
+fi
+
+# Tenta extrair o container do reverse_proxy
+CONTAINER=$(grep reverse_proxy "$CONF_FILE" | sed -E 's/.*reverse_proxy[[:space:]]+([^:]+):.*/\1/' | head -n1)
+
+if [[ -z "$CONTAINER" ]]; then
+  echo "⚠️ Não foi possível extrair o nome do container."
+  exit 1
+fi
+
+SITE_NAME=${CONTAINER#wp_}
+SITE_DIR="$HOME/sites/$SITE_NAME"
+
+echo -e "\n🔎 Informações encontradas:"
+echo "🌍 DOMÍNIO.........: $DOMAIN"
+echo "📦 CONTAINER.......: $CONTAINER"
+echo "🗄 BANCO DE DADOS..: $SITE_NAME"
+echo "👤 USUÁRIO BD......: $SITE_NAME"
+echo "📁 DIRETÓRIO.......: $SITE_DIR"
+echo "📝 CADDY CONF......: $CONF_FILE"
+
+# Status do container
+if podman ps --format "{{.Names}}" | grep -q "^$CONTAINER$"; then
+  echo "✅ STATUS...........: Container está rodando"
+else
+  echo "⛔ STATUS...........: Container parado ou inexistente"
+fi
+
+# Info extra: volume, IP e mount
+echo -e "\n📦 Detalhes adicionais:"
+podman inspect "$CONTAINER" --format '
+📛 Nome real: {{.Name}}
+🔌 IP interno: {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}
+🗂 Mounts:
+{{range .Mounts}} - {{.Source}} → {{.Destination}}{{"\n"}}{{end}}
+'
+
+echo -e "\n⚠️ Senha do banco não é armazenada por segurança. Certifique-se de tê-la salvo no momento da criação."

@@ -1,0 +1,383 @@
+#novo-site
+
+#!/bin/bash
+
+# ───────────────────────────────────────────────────────
+# 🧹 Limpeza inicial
+# ───────────────────────────────────────────────────────
+clear
+echo -e "\n🌟 Criando novo site WordPress rootless com Podman + Caddy (modular)"
+echo "───────────────────────────────────────────────────────"
+
+# ───────────────────────────────────────────────────────
+# 🔧 Coleta de informações do usuário (versão automática)
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 Iniciando Coleta de Informações..."
+
+read -p "🌐 Domínio do site (ex: sabrina.4have.com.br): " DOMAIN
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "⛔ O domínio do site é obrigatório."
+  exit 1
+fi
+
+SITE_NAME="$DOMAIN"
+SANITIZED_NAME=${SITE_NAME//./_}
+DB_NAME="$SANITIZED_NAME"
+DB_USER="$SANITIZED_NAME"
+
+DB_PASS=$(openssl rand -base64 24)
+ESCAPED_PASS=$(printf '%s\n' "$DB_PASS" | sed -e 's/[\/&]/\\&/g')
+
+echo "🔘 Nome interno do site: $SITE_NAME"
+echo "📂 Nome do banco de dados: $DB_NAME"
+echo "👤 Nome do usuário do banco: $DB_USER"
+echo "🔐 Senha gerada para o banco: $DB_PASS"
+
+
+#───────────────────────────────────────────────────────
+# 🔑 Validação da senha do root do MariaDB (com host explícito)
+#───────────────────────────────────────────────────────
+
+echo -e "\n🔔 Iniciando Validação da Senha Root do MariaDB..."
+
+# 🔐 Segurança extra
+set +o history
+
+TRIES=1
+MAX=3
+MYSQL_ROOT_PASS=""  # 👈 importante: define como variável global
+
+while [ $TRIES -le $MAX ]; do
+  echo
+  read -s -p "🔑 Informe a senha do root do MariaDB (tentativa $TRIES de $MAX): " TENTATIVA_PASS
+  echo -e "\n⏳ Testando conexão com o banco..."
+
+  if podman run --rm --network container:mariadb-container \
+    --env MYSQL_PWD="$TENTATIVA_PASS" \
+    docker.io/mysql:5.7 \
+    mysqladmin ping -u root -h127.0.0.1 --silent &>/dev/null; then
+    MYSQL_ROOT_PASS="$TENTATIVA_PASS"  # ✅ agora é visível fora do loop
+    break
+  else
+    echo "❌ Senha incorreta."
+  fi
+
+  ((TRIES++))
+  [ $TRIES -gt $MAX ] && echo "⛔ Senha incorreta $MAX vezes. Cancelando." && set -o history && exit 1
+  sleep 1
+done
+
+
+echo "✅ Senha validada com sucesso!"
+
+# ───────────────────────────────────────────────────────
+# 📆 Verificando se banco já contém instalação WordPress
+# ───────────────────────────────────────────────────────
+echo -e "\n🔎 Verificando existência de tabelas no banco '$DB_NAME'..."
+EXISTE_TABELA=$(podman exec mariadb-container \
+  env MYSQL_PWD="$MYSQL_ROOT_PASS" \
+  mysql -u root -N -B -e "USE \`$DB_NAME\`; SHOW TABLES LIKE 'wp_options';")
+
+if [[ -n "$EXISTE_TABELA" ]]; then
+  echo "⚠️ Banco '$DB_NAME' já possui instalação do WordPress. Deseja apagar o banco para nova instalação? (s/N)"
+  read -r RESET_DB
+  if [[ "$RESET_DB" =~ ^[sS]$ ]]; then
+    podman exec mariadb-container \
+      env MYSQL_PWD="$MYSQL_ROOT_PASS" \
+      mysql -u root -e "DROP DATABASE \`$DB_NAME\`;"
+    echo "🗑️ Banco '$DB_NAME' removido. Será recriado em seguida."
+  else
+    echo "🚫 Instalação abortada para evitar sobrescrita do banco."
+    exit 1
+  fi
+fi
+
+
+# ───────────────────────────────────────────────────────
+# 🛠️ Criando banco de dados, usuário e permissões no MariaDB
+# ───────────────────────────────────────────────────────
+echo -e "\n🧱 Reforçando criação de banco, usuário e permissões..."
+
+if podman exec mariadb-container \
+  env MYSQL_PWD="$MYSQL_ROOT_PASS" \
+  mysql -u root -e "\
+    CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; \
+    DROP USER IF EXISTS '$DB_USER'@'%'; \
+    CREATE USER '$DB_USER'@'%' IDENTIFIED BY '$DB_PASS'; \
+    GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'%'; \
+    FLUSH PRIVILEGES;"; then
+
+  echo "✅ Banco '$DB_NAME' e usuário '$DB_USER' reconfigurados com sucesso."
+else
+  echo "❌ Falha ao reconfigurar banco e usuário."
+  exit 1
+fi
+
+#
+# ───────────────────────────────────────────────────────
+# 📁 Criação do diretório e download do WordPress
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 Iniciando Criação do Diretório e Download do WordPress..."
+
+SITE_DIR="/home/site4have/sites/$SITE_NAME"
+
+if [ -d "$SITE_DIR" ]; then
+  echo "⚠️ O diretório $SITE_DIR já existe. Deseja sobrescrever? (s/N)"
+  read -r CONFIRM
+  [[ "$CONFIRM" =~ ^[sS]$ ]] || exit 1
+fi
+
+mkdir -p "$SITE_DIR"
+curl -sL https://wordpress.org/latest.tar.gz | tar xz -C "$SITE_DIR" --strip-components=1
+
+CREDENTIALS_FILE="$SITE_DIR/.env"
+cat <<EOF > "$CREDENTIALS_FILE"
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASS=$DB_PASS
+EOF
+chmod 600 "$CREDENTIALS_FILE"
+echo "🗃️ Credenciais salvas em: $CREDENTIALS_FILE"
+
+# ───────────────────────────────────────────────────────
+# 🐘 Criação do Container WordPress (modo travado)
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 Iniciando Criação do Container WordPress..."
+
+CONTAINER_NAME="wp_${SANITIZED_NAME}"
+SITE_DIR="/home/site4have/sites/$SITE_NAME"
+
+# Remove container se parado ou travado
+if podman container exists "$CONTAINER_NAME"; then
+  echo "🔄 Container '$CONTAINER_NAME' já existe."
+  if [ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]; then
+    echo "⚠️ Container '$CONTAINER_NAME' está parado. Removendo..."
+    podman rm "$CONTAINER_NAME"
+  else
+    echo "✅ Container já está rodando. Pulando criação."
+  fi
+fi
+
+if ! podman container exists "$CONTAINER_NAME"; then
+podman run -d \
+  --name "$CONTAINER_NAME" \
+  --network shared_network \
+  -v "$SITE_DIR":/var/www/html \
+  --entrypoint "sleep" \
+  -e WORDPRESS_DB_HOST="mariadb-container" \
+  -e WORDPRESS_DB_NAME="$DB_NAME" \
+  -e WORDPRESS_DB_USER="$DB_USER" \
+  -e WORDPRESS_DB_PASSWORD="$DB_PASS" \
+  docker.io/library/wordpress:latest infinity
+
+  sleep 2
+  echo "✅ Container '$CONTAINER_NAME' criado com sucesso (modo travado)."
+fi
+
+# ───────────────────────────────────────────────────────
+# 🧱 BLOCO BASE: Estrutura de diretórios e rede
+# ───────────────────────────────────────────────────────
+BASE_DIR="$HOME"
+SITES_DIR="$BASE_DIR/sites"
+CADDY_DIR="$BASE_DIR/Caddy"
+CADDY_SITES_DIR="$CADDY_DIR/sites"
+CADDYFILE="$CADDY_DIR/Caddyfile"
+
+mkdir -p "$SITES_DIR" "$CADDY_SITES_DIR"
+[ ! -f "$CADDYFILE" ] && echo "import /etc/caddy/sites/*.conf" > "$CADDYFILE"
+
+# ───────────────────────────────────────────────────────
+# 🐳 BLOCO CADDY: Container base
+# ───────────────────────────────────────────────────────
+podman rm -f caddy
+
+podman run -d \
+  --name caddy \
+  --network shared_network \
+  -p 80:80 -p 443:443 \
+  -v "$CADDYFILE":/etc/caddy/Caddyfile:ro \
+  -v "$CADDY_SITES_DIR":/etc/caddy/sites:ro \
+  -v caddy_data:/data \
+  -v caddy_config:/config \
+  docker.io/caddy:latest
+
+# ───────────────────────────────────────────────────────
+# ⚙️ BLOCO WP-CONFIG: Geração manual e proxy fix
+# ───────────────────────────────────────────────────────
+
+echo -e "\nℹ️ A instalação do WordPress será feita manualmente pelo navegador."
+echo -e "\n⚙️ Gerando wp-config.php manualmente..."
+
+WP_CONFIG_PATH="$SITE_DIR/wp-config.php"
+
+cat <<EOF > "$WP_CONFIG_PATH"
+<?php
+define( 'DB_NAME', '$DB_NAME' );
+define( 'DB_USER', '$DB_USER' );
+define( 'DB_PASSWORD', '$DB_PASS' );
+define( 'DB_HOST', 'mariadb-container' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+// Chaves de autenticação únicas
+define('AUTH_KEY',         '$(openssl rand -base64 32)');
+define('SECURE_AUTH_KEY',  '$(openssl rand -base64 32)');
+define('LOGGED_IN_KEY',    '$(openssl rand -base64 32)');
+define('NONCE_KEY',        '$(openssl rand -base64 32)');
+define('AUTH_SALT',        '$(openssl rand -base64 32)');
+define('SECURE_AUTH_SALT', '$(openssl rand -base64 32)');
+define('LOGGED_IN_SALT',   '$(openssl rand -base64 32)');
+define('NONCE_SALT',       '$(openssl rand -base64 32)');
+
+\$table_prefix = 'wp_';
+
+define( 'WP_DEBUG', false );
+
+/** Corrige HTTPS atrás de proxy reverso como Caddy */
+if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+    \$_SERVER['HTTPS'] = 'on';
+}
+
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+
+// 🛠️ Força escrita direta de arquivos (sem FTP)
+define( 'FS_METHOD', 'direct' );
+
+require_once ABSPATH . 'wp-settings.php';
+EOF
+
+chmod 640 "$WP_CONFIG_PATH"
+echo "✅ wp-config.php criado manualmente com sucesso!"
+
+# Copiando wp-config.php fixo para dentro do container (com FS_METHOD já incluso)
+echo -e "\n📁 Copiando wp-config.php fixo (com FS_METHOD) para dentro do container..."
+podman cp "$WP_CONFIG_PATH" "$CONTAINER_NAME":/var/www/html/wp-config.php
+podman exec "$CONTAINER_NAME" chown www-data:www-data /var/www/html/wp-config.php
+podman exec "$CONTAINER_NAME" chmod 640 /var/www/html/wp-config.php
+echo "✅ wp-config.php copiado com sucesso para dentro do container!"
+
+echo -e "\n🔧 Corrigindo permissões da pasta wp-content..."
+podman exec "$CONTAINER_NAME" chown -R www-data:www-data /var/www/html/wp-content
+podman exec "$CONTAINER_NAME" chmod -R 755 /var/www/html/wp-content
+echo "✅ Permissões de wp-content ajustadas com sucesso!"
+
+
+# ───────────────────────────────────────────────────────
+# 🔀 BLOCO CADDYFILE DO SITE
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 Iniciando Criação do Arquivo de Configuração Caddy..."
+
+SANITIZED_DOMAIN=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g')
+CADDY_CONF="$CADDY_SITES_DIR/${SANITIZED_DOMAIN}.conf"
+
+cat <<EOF > "$CADDY_CONF"
+$DOMAIN {
+    reverse_proxy $CONTAINER_NAME:80
+}
+EOF
+
+echo "✅ Arquivo Caddy gerado: $CADDY_CONF"
+
+# ────────────────────────────────────────────────
+# 🛠️ Corrigindo Permissões do wp-config.php
+# ────────────────────────────────────────────────
+
+# 🛠️ Corrigindo Permissões do wp-config.php (se existir dentro do container)
+echo -e "\n🔧 Corrigindo permissões do wp-config.php dentro do container (se existir)..."
+
+if podman exec "$CONTAINER_NAME" test -f /var/www/html/wp-config.php; then
+  podman exec "$CONTAINER_NAME" chown www-data:www-data /var/www/html/wp-config.php 2>/dev/null
+  podman exec "$CONTAINER_NAME" chmod 644 /var/www/html/wp-config.php 2>/dev/null
+  echo "✅ Permissões ajustadas com sucesso!"
+else
+  echo "ℹ️ wp-config.php não está presente dentro do container (esperado). Pulando ajuste de permissões."
+fi
+
+
+# 🔍 Validando Caddyfile
+echo -e "\n🔍 Validando Caddyfile..."
+podman run --rm \
+  -v "$CADDY_DIR":/etc/caddy \
+  docker.io/caddy:latest caddy validate --config /etc/caddy/Caddyfile
+
+if [ $? -ne 0 ]; then
+  echo "❌ Erro de validação no Caddyfile"
+  exit 1
+fi
+
+# 🔁 Recarregando Caddy
+echo -e "\n🔁 Recarregando Caddy..."
+podman exec caddy caddy reload --config /etc/caddy/Caddyfile
+
+# ───────────────────────────────────────────────────────
+# 🔁 Reiniciando container WordPress com Apache rodando
+# ───────────────────────────────────────────────────────
+
+echo -e "\n🔁 Reiniciando container WordPress no modo final..."
+podman stop "$CONTAINER_NAME" >/dev/null || true
+podman rm "$CONTAINER_NAME" >/dev/null || true
+
+podman run -d \
+  --name "$CONTAINER_NAME" \
+  --network shared_network \
+  -v "$SITE_DIR":/var/www/html \
+  -e WORDPRESS_DB_HOST="mariadb-container" \
+  -e WORDPRESS_DB_NAME="$DB_NAME" \
+  -e WORDPRESS_DB_USER="$DB_USER" \
+  -e WORDPRESS_DB_PASSWORD="$DB_PASS" \
+  docker.io/library/wordpress:latest
+
+if [ $? -eq 0 ]; then
+  echo "✅ Container '$CONTAINER_NAME' reiniciado com sucesso!"
+else
+  echo "❌ Erro ao reiniciar o container '$CONTAINER_NAME'."
+  exit 1
+fi
+
+# ───────────────────────────────────────────────────────
+# 🔎 Teste de Conexão com o WordPress (dentro do container)
+# ───────────────────────────────────────────────────────
+
+echo -e "\n🔔 Testando Conexão com o WordPress (internamente)..."
+printf "⏳ Aguardando conexão com o WordPress"
+
+for ((i = 1; i <= 60; i++)); do
+  HTTP_CODE=$(podman exec "$CONTAINER_NAME" curl -s -o /dev/null -w "%{http_code}" http://localhost/wp-login.php)
+
+  if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
+    echo -e "\n✅ WordPress respondendo corretamente dentro do container!"
+    break
+  fi
+
+  # Mostra logs a partir do 30s
+  if [ "$i" -eq 30 ]; then
+    echo -e "\n📝 Logs parciais do container:"
+    podman logs "$CONTAINER_NAME" | tail -n 10
+  fi
+
+  printf "."
+  sleep 1
+done
+
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "302" ]]; then
+  echo -e "\n❌ O WordPress não respondeu após 60 segundos (nem mesmo internamente)."
+  echo "🔍 Logs completos:"
+  podman logs "$CONTAINER_NAME"
+  exit 1
+fi
+
+# ───────────────────────────────────────────────────────
+# ✅ Finalização
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 Iniciando Finalização..."
+
+echo -e "\n🎉 Site criado com sucesso!"
+echo "🌍 Domínio:         $DOMAIN"
+echo "📦 Container:       $CONTAINER_NAME"
+echo "📂 Banco de Dados:  $DB_NAME"
+echo "👤 Usuário BD:      $DB_USER"
+echo "🔐 Senha BD:        $DB_PASS"
+echo "📁 Diretório:       $SITE_DIR"

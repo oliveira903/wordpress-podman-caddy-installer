@@ -1,0 +1,314 @@
+#script-base
+
+#!/bin/bash
+
+# #!/bin/bash
+set -e  # Encerra o script se qualquer comando falhar
+
+echo -e "\n🔔 BLOCO 1: Iniciando criação da estrutura de diretórios..."
+
+# Diretórios base
+SITES_DIR="/home/site4have/sites"
+CADDY_DIR="/home/site4have/Caddy"
+CADDY_SITES_DIR="$CADDY_DIR/sites"
+CADDYFILE="$CADDY_DIR/Caddyfile"
+
+# Verifica permissão para criar diretório base
+BASE_DIR="/home/site4have"
+if [ ! -d "$BASE_DIR" ]; then
+  echo "❌ Diretório base não existe: $BASE_DIR"
+  exit 1
+elif [ ! -w "$BASE_DIR" ]; then
+  echo "❌ Sem permissão para escrever em: $BASE_DIR"
+  exit 1
+fi
+
+# Criação da pasta dos sites
+if [ ! -d "$SITES_DIR" ]; then
+  mkdir -p "$SITES_DIR"
+  echo "✅ Diretório criado: $SITES_DIR"
+else
+  echo "🔄 Diretório já existe: $SITES_DIR"
+fi
+
+# Criação da pasta principal do Caddy
+if [ ! -d "$CADDY_DIR" ]; then
+  mkdir -p "$CADDY_DIR"
+  echo "✅ Diretório criado: $CADDY_DIR"
+else
+  echo "🔄 Diretório já existe: $CADDY_DIR"
+fi
+
+# Criação da subpasta de sites do Caddy
+if [ ! -d "$CADDY_SITES_DIR" ]; then
+  mkdir -p "$CADDY_SITES_DIR"
+  echo "✅ Diretório criado: $CADDY_SITES_DIR"
+else
+  echo "🔄 Diretório já existe: $CADDY_SITES_DIR"
+fi
+
+# Verifica permissão para criar o Caddyfile
+if [ ! -w "$CADDY_DIR" ]; then
+  echo "❌ Sem permissão para criar arquivo em: $CADDY_DIR"
+  exit 1
+fi
+
+# Criação do Caddyfile principal com import, se não existir
+if [ ! -f "$CADDYFILE" ]; then
+  echo "import $CADDY_SITES_DIR/*.conf" > "$CADDYFILE"
+  echo "✅ Arquivo criado: $CADDYFILE (com linha de importação)"
+else
+  echo "🔄 Arquivo já existe: $CADDYFILE"
+fi
+
+echo -e "✅ BLOCO 1 finalizado com sucesso!\n"
+#───────────────────────────────────────────────────────
+# 🌐 BLOCO 2 — CRIAÇÃO DA REDE PODMAN COMPARTILHADA (AMPLIADA)
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 BLOCO 2: Iniciando criação da rede Podman compartilhada..."
+
+NETWORK_NAME="shared_network"
+SUBNET="192.168.0.0/16"
+GATEWAY="192.168.0.1"
+
+# Verifica se a rede já existe
+if podman network exists "$NETWORK_NAME"; then
+  echo "🔄 A rede '$NETWORK_NAME' já existe."
+else
+  podman network create \
+    --subnet "$SUBNET" \
+    --gateway "$GATEWAY" \
+    "$NETWORK_NAME"
+
+  if [ $? -eq 0 ]; then
+    echo "✅ Rede '$NETWORK_NAME' criada com sucesso!"
+    echo "🛣️ Subrede: $SUBNET | Gateway: $GATEWAY"
+  else
+    echo "❌ Falha ao criar a rede '$NETWORK_NAME'."
+    exit 1
+  fi
+fi
+
+echo -e "✅ BLOCO 2 finalizado com sucesso!\n"
+
+# ───────────────────────────────────────────────────────
+# 🐳 BLOCO 3 — CRIAÇÃO DOS CONTAINERS BASE (MariaDB + Caddy)
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 BLOCO 3: Iniciando criação dos containers base..."
+
+# Diretórios criados no Bloco 1
+USER_HOME=$(eval echo ~"$USER")
+CADDY_DIR="$USER_HOME/Caddy"
+CADDY_SITES_DIR="$CADDY_DIR/sites"
+CADDYFILE="$CADDY_DIR/Caddyfile"
+
+# Gerar senha aleatória segura para o MariaDB root
+MARIADB_ROOT_PASS=$(openssl rand -base64 24)
+echo "🔐 Senha root do MariaDB gerada automaticamente."
+
+# Container MariaDB
+MARIADB_NAME="mariadb-container"
+MARIADB_VOLUME="mariadb_data"
+
+if podman container exists "$MARIADB_NAME"; then
+  echo "🔄 Container MariaDB '$MARIADB_NAME' já existe."
+else
+  podman volume create "$MARIADB_VOLUME" >/dev/null
+
+  podman run -d \
+    --name "$MARIADB_NAME" \
+    --network shared_network \
+    -e MYSQL_ROOT_PASSWORD="$MARIADB_ROOT_PASS" \
+    -v "$MARIADB_VOLUME":/var/lib/mysql \
+    docker.io/library/mariadb:10.6
+
+  if [ $? -eq 0 ]; then
+    echo "✅ Container '$MARIADB_NAME' criado com sucesso!"
+    echo -e "\n🔑 \e[1mSenha gerada para o usuário root do MariaDB:\e[0m\n\e[1;32m$MARIADB_ROOT_PASS\e[0m\n"
+  else
+    echo "❌ Erro ao criar o container '$MARIADB_NAME'."
+    exit 1
+  fi
+fi
+
+# Container Caddy
+CADDY_NAME="caddy"
+CADDY_VOLUME_DATA="caddy_data"
+CADDY_VOLUME_CONFIG="caddy_config"
+
+if podman container exists "$CADDY_NAME"; then
+  echo "🔄 Container Caddy '$CADDY_NAME' já existe."
+else
+  podman volume create "$CADDY_VOLUME_DATA" >/dev/null
+  podman volume create "$CADDY_VOLUME_CONFIG" >/dev/null
+
+  podman run -d \
+    --name "$CADDY_NAME" \
+    --network shared_network \
+    -p 80:80 -p 443:443 \
+    -v "$CADDYFILE":/etc/caddy/Caddyfile:ro \
+    -v "$CADDY_SITES_DIR":/etc/caddy/sites:ro \
+    -v "$CADDY_VOLUME_DATA":/data \
+    -v "$CADDY_VOLUME_CONFIG":/config \
+    docker.io/caddy:latest
+
+  if [ $? -eq 0 ]; then
+    echo "✅ Container '$CADDY_NAME' criado com sucesso!"
+  else
+    echo "❌ Erro ao criar o container '$CADDY_NAME'."
+    exit 1
+  fi
+fi
+
+echo -e "✅ BLOCO 3 finalizado com sucesso!\n"
+
+# ───────────────────────────────────────────────────────
+# ⚙️ BLOCO 4 — INSTALAÇÃO DE SERVIÇOS SYSTEMD PARA CONTAINERS
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 BLOCO 4: Instalando serviços systemd para manter containers ativos..."
+
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+mkdir -p "$SYSTEMD_USER_DIR"
+
+# Habilita linger para que os serviços continuem mesmo com o usuário deslogado
+echo "🔧 Habilitando linger para o usuário $USER..."
+if loginctl enable-linger "$USER"; then
+  echo "✅ Linger habilitado com sucesso!"
+else
+  echo "⚠️ Falha ao habilitar linger. Verifique permissões (precisa de sudo/root)."
+fi
+
+# MariaDB - Service Unit
+cat <<EOF > "$SYSTEMD_USER_DIR/podman-mariadb-container.service"
+[Unit]
+Description=MariaDB container via Podman
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/podman start -a mariadb-container
+ExecStop=/usr/bin/podman stop -t 10 mariadb-container
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Caddy - Service Unit
+cat <<EOF > "$SYSTEMD_USER_DIR/podman-caddy.service"
+[Unit]
+Description=Caddy container via Podman
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/podman start -a caddy
+ExecStop=/usr/bin/podman stop -t 10 caddy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Recarrega e ativa os serviços
+systemctl --user daemon-reexec
+systemctl --user daemon-reload
+
+systemctl --user enable podman-mariadb-container.service
+systemctl --user enable podman-caddy.service
+
+systemctl --user start podman-mariadb-container.service
+systemctl --user start podman-caddy.service
+
+echo "✅ Serviços systemd criados e ativados!"
+echo "🔁 Containers agora serão reiniciados automaticamente se pararem ou ao reiniciar o sistema."
+echo -e "✅ BLOCO 4 finalizado com sucesso!\n"
+# ───────────────────────────────────────────────────────
+# ✅ BLOCO 5 — VERIFICAÇÃO FINAL E RESUMO
+# ───────────────────────────────────────────────────────
+echo -e "\n🔔 BLOCO 5: Verificando integridade do ambiente e serviços..."
+
+STATUS_OK=true
+
+echo -e "\n📂 Verificando diretórios..."
+check_dir() {
+  if [ -d "$1" ]; then
+    echo "✅ Existe: $1"
+  else
+    echo "❌ Não encontrado: $1"
+    STATUS_OK=false
+  fi
+}
+check_dir "/home/site4have/sites"
+check_dir "/home/site4have/Caddy"
+check_dir "/home/site4have/Caddy/sites"
+
+echo -e "\n📄 Verificando arquivos essenciais..."
+[ -f "/home/site4have/Caddy/Caddyfile" ] && echo "✅ Caddyfile encontrado" || { echo "❌ Caddyfile ausente"; STATUS_OK=false; }
+
+echo -e "\n🌐 Verificando rede Podman..."
+if podman network exists shared_network; then
+  echo "✅ Rede 'shared_network' está ativa"
+else
+  echo "❌ Rede 'shared_network' não existe"
+  STATUS_OK=false
+fi
+
+echo -e "\n🐳 Verificando containers..."
+check_container() {
+  if podman container exists "$1"; then
+    if [ "$(podman inspect -f '{{.State.Running}}' "$1")" == "true" ]; then
+      echo "✅ Container '$1' está em execução"
+    else
+      echo "❌ Container '$1' existe, mas está parado"
+      STATUS_OK=false
+    fi
+  else
+    echo "❌ Container '$1' não existe"
+    STATUS_OK=false
+  fi
+}
+check_container "mariadb-container"
+check_container "caddy"
+
+echo -e "\n🛠️ Verificando serviços systemd..."
+check_service() {
+  systemctl --user is-enabled "$1" &>/dev/null && ENABLED="Sim" || ENABLED="Não"
+  systemctl --user is-active "$1" &>/dev/null && ACTIVE="Ativo" || ACTIVE="Inativo"
+  echo "🔧 $1 — Ativo: $ACTIVE | Habilitado: $ENABLED"
+  [[ $ACTIVE == "Ativo" ]] && [[ $ENABLED == "Sim" ]] || STATUS_OK=false
+}
+check_service "podman-mariadb-container.service"
+check_service "podman-caddy.service"
+
+# RESUMO
+echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📦 RESUMO DO AMBIENTE CONFIGURADO:"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📁 Diretórios:"
+echo "  - /home/site4have/sites"
+echo "  - /home/site4have/Caddy"
+echo "  - /home/site4have/Caddy/sites"
+echo
+echo "📄 Arquivos:"
+echo "  - /home/site4have/Caddy/Caddyfile"
+echo "  - ~/.config/systemd/user/podman-mariadb-container.service"
+echo "  - ~/.config/systemd/user/podman-caddy.service"
+echo
+echo "🌐 Rede:"
+echo "  - Nome: shared_network"
+echo "  - Faixa IP: personalizada (ex: 192.168.100.0/24)"
+echo
+echo "🐳 Containers:"
+echo "  - mariadb-container (imagem: mariadb:10.6)"
+echo "  - caddy (imagem: caddy:latest)"
+echo
+echo "🛠️ systemd (modo usuário):"
+echo "  - Serviços criados e ativados para reinício automático"
+echo
+if $STATUS_OK; then
+  echo "✅ AMBIENTE CONFIGURADO COM SUCESSO!"
+else
+  echo "⚠️ ALGUNS ITENS FALHARAM. VERIFIQUE AS MENSAGENS ACIMA."
+fi
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
